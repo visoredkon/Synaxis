@@ -1,0 +1,190 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - synaxis-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  lock-node-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.lock
+    environment:
+      - NODE_ID=lock-node-1
+      - NODE_HOST=0.0.0.0
+      - NODE_PORT=8001
+      - CLUSTER_NODES=lock-node-1:8001,lock-node-2:8002,lock-node-3:8003
+      - REDIS_HOST=redis
+      - RAFT_ELECTION_TIMEOUT_MIN=2000
+      - RAFT_ELECTION_TIMEOUT_MAX=10000
+      - RAFT_HEARTBEAT_INTERVAL=500
+      - LOG_LEVEL=DEBUG
+    ports:
+      - "8001:8001"
+    networks:
+      - synaxis-net
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  lock-node-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.lock
+    environment:
+      - NODE_ID=lock-node-2
+      - NODE_HOST=0.0.0.0
+      - NODE_PORT=8002
+      - CLUSTER_NODES=lock-node-1:8001,lock-node-2:8002,lock-node-3:8003
+      - REDIS_HOST=redis
+      - RAFT_ELECTION_TIMEOUT_MIN=2000
+      - RAFT_ELECTION_TIMEOUT_MAX=10000
+      - RAFT_HEARTBEAT_INTERVAL=500
+      - LOG_LEVEL=DEBUG
+    ports:
+      - "8002:8002"
+    networks:
+      - synaxis-net
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  lock-node-3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.lock
+    environment:
+      - NODE_ID=lock-node-3
+      - NODE_HOST=0.0.0.0
+      - NODE_PORT=8003
+      - CLUSTER_NODES=lock-node-1:8001,lock-node-2:8002,lock-node-3:8003
+      - REDIS_HOST=redis
+      - RAFT_ELECTION_TIMEOUT_MIN=2000
+      - RAFT_ELECTION_TIMEOUT_MAX=10000
+      - RAFT_HEARTBEAT_INTERVAL=500
+      - LOG_LEVEL=DEBUG
+    ports:
+      - "8003:8003"
+    networks:
+      - synaxis-net
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  queue-node-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.queue
+    environment:
+      - NODE_ID=queue-node-1
+      - NODE_HOST=0.0.0.0
+      - NODE_PORT=8011
+      - CLUSTER_NODES=queue-node-1:8011,queue-node-2:8012,queue-node-3:8013
+      - REDIS_HOST=redis
+      - QUEUE_PARTITIONS=16
+      - LOG_LEVEL=DEBUG
+    ports:
+      - "8011:8011"
+    networks:
+      - synaxis-net
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  queue-node-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.queue
+    environment:
+      - NODE_ID=queue-node-2
+      - NODE_HOST=0.0.0.0
+      - NODE_PORT=8012
+      - CLUSTER_NODES=queue-node-1:8011,queue-node-2:8012,queue-node-3:8013
+      - REDIS_HOST=redis
+      - QUEUE_PARTITIONS=16
+      - LOG_LEVEL=DEBUG
+    ports:
+      - "8012:8012"
+    networks:
+      - synaxis-net
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  queue-node-3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.queue
+    environment:
+      - NODE_ID=queue-node-3
+      - NODE_HOST=0.0.0.0
+      - NODE_PORT=8013
+      - CLUSTER_NODES=queue-node-1:8011,queue-node-2:8012,queue-node-3:8013
+      - REDIS_HOST=redis
+      - QUEUE_PARTITIONS=16
+      - LOG_LEVEL=DEBUG
+    ports:
+      - "8013:8013"
+    networks:
+      - synaxis-net
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  cache-node-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cache
+    environment:
+      - NODE_ID=cache-node-1
+      - NODE_HOST=0.0.0.0
+      - NODE_PORT=8021
+      - CLUSTER_NODES=cache-node-1:8021,cache-node-2:8022,cache-node-3:8023
+      - CACHE_SIZE=1000
+      - LOG_LEVEL=DEBUG
+    ports:
+      - "8021:8021"
+    networks:
+      - synaxis-net
+
+  cache-node-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cache
+    environment:
+      - NODE_ID=cache-node-2
+      - NODE_HOST=0.0.0.0
+      - NODE_PORT=8022
+      - CLUSTER_NODES=cache-node-1:8021,cache-node-2:8022,cache-node-3:8023
+      - CACHE_SIZE=1000
+      - LOG_LEVEL=DEBUG
+    ports:
+      - "8022:8022"
+    networks:
+      - synaxis-net
+
+  cache-node-3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cache
+    environment:
+      - NODE_ID=cache-node-3
+      - NODE_HOST=0.0.0.0
+      - NODE_PORT=8023
+      - CLUSTER_NODES=cache-node-1:8021,cache-node-2:8022,cache-node-3:8023
+      - CACHE_SIZE=1000
+      - LOG_LEVEL=DEBUG
+    ports:
+      - "8023:8023"
+    networks:
+      - synaxis-net
+
+networks:
+  synaxis-net:
+    driver: bridge

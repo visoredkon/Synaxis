@@ -1,0 +1,19 @@
+src = ["src", "tests"]
+target-version = "py314"
+
+[analyze]
+detect-string-imports = true
+
+[format]
+docstring-code-format = true
+indent-style = "space"
+line-ending = "auto"
+quote-style = "double"
+skip-magic-trailing-comma = false
+
+[lint]
+fixable = ["ALL"]
+extend-select = ["ANN", "I"]
+
+[lint.pydocstyle]
+convention = "google"

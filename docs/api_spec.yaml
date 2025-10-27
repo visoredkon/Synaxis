@@ -1,0 +1,523 @@
+openapi: 3.0.3
+info:
+  title: Synaxis Distributed Synchronization System API
+  description: |
+    API specification for Synaxis distributed system components:
+    - Distributed Lock Manager (Raft consensus-based)
+    - Distributed Queue System (Consistent hashing-based)
+    - Distributed Cache System (MESI protocol-based)
+
+    All endpoints use MessagePack binary serialization for efficient communication.
+  version: 1.0.0
+  contact:
+    name: Synaxis Team
+    url: https://github.com/yourusername/synaxis
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8001
+    description: Lock Manager Node 1
+  - url: http://localhost:8002
+    description: Lock Manager Node 2
+  - url: http://localhost:8003
+    description: Lock Manager Node 3
+  - url: http://localhost:8011
+    description: Queue Node 1
+  - url: http://localhost:8012
+    description: Queue Node 2
+  - url: http://localhost:8013
+    description: Queue Node 3
+  - url: http://localhost:8021
+    description: Cache Node 1
+  - url: http://localhost:8022
+    description: Cache Node 2
+  - url: http://localhost:8023
+    description: Cache Node 3
+
+tags:
+  - name: Lock Manager
+    description: Distributed lock operations using Raft consensus
+  - name: Queue System
+    description: Message queue operations with consistent hashing
+  - name: Cache System
+    description: Distributed cache with MESI coherence protocol
+  - name: Consensus
+    description: Raft consensus internal operations
+
+paths:
+  /message:
+    post:
+      summary: Send message to node
+      description: |
+        Unified endpoint for all message types. The request body must be MessagePack encoded.
+        The `type` field determines the operation to perform.
+      tags:
+        - Lock Manager
+        - Queue System
+        - Cache System
+      requestBody:
+        required: true
+        content:
+          application/msgpack:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/LockRequest"
+                - $ref: "#/components/schemas/LockRelease"
+                - $ref: "#/components/schemas/EnqueueRequest"
+                - $ref: "#/components/schemas/DequeueRequest"
+                - $ref: "#/components/schemas/CachePut"
+                - $ref: "#/components/schemas/CacheGet"
+                - $ref: "#/components/schemas/AppendEntries"
+                - $ref: "#/components/schemas/RequestVote"
+      responses:
+        "200":
+          description: Operation successful
+          content:
+            application/msgpack:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/LockResponse"
+                  - $ref: "#/components/schemas/QueueResponse"
+                  - $ref: "#/components/schemas/CacheResponse"
+                  - $ref: "#/components/schemas/RaftResponse"
+        "400":
+          description: Bad request - invalid message format
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Service unavailable - not leader or no quorum
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+components:
+  schemas:
+    LockRequest:
+      type: object
+      required:
+        - type
+        - lock_id
+        - lock_type
+        - requester
+      properties:
+        type:
+          type: string
+          enum: [lock_request]
+          description: Message type identifier
+        lock_id:
+          type: string
+          description: Unique identifier for the lock resource
+          example: "resource_database_1"
+        lock_type:
+          type: string
+          enum: [exclusive, shared]
+          description: Type of lock to acquire
+        requester:
+          type: string
+          description: ID of the client requesting the lock
+          example: "client_app_1"
+        timeout:
+          type: number
+          format: float
+          description: Optional timeout in seconds
+          default: 30.0
+      example:
+        type: lock_request
+        lock_id: "resource_database_1"
+        lock_type: "exclusive"
+        requester: "client_app_1"
+        timeout: 30.0
+
+    LockRelease:
+      type: object
+      required:
+        - type
+        - lock_id
+      properties:
+        type:
+          type: string
+          enum: [lock_release]
+          description: Message type identifier
+        lock_id:
+          type: string
+          description: Unique identifier for the lock to release
+          example: "resource_database_1"
+        requester:
+          type: string
+          description: ID of the client releasing the lock
+          example: "client_app_1"
+      example:
+        type: lock_release
+        lock_id: "resource_database_1"
+        requester: "client_app_1"
+
+    LockResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [granted, released, denied, timeout]
+          description: Result of the lock operation
+        lock_id:
+          type: string
+          description: The lock ID from the request
+        message:
+          type: string
+          description: Additional information about the operation
+        leader:
+          type: string
+          description: Current leader node ID (if operation was forwarded)
+      example:
+        status: granted
+        lock_id: "resource_database_1"
+        message: "Lock acquired successfully"
+
+    EnqueueRequest:
+      type: object
+      required:
+        - type
+        - queue_name
+        - data
+        - message_id
+        - timestamp
+      properties:
+        type:
+          type: string
+          enum: [enqueue]
+          description: Message type identifier
+        queue_name:
+          type: string
+          description: Name of the queue to enqueue to
+          example: "task_queue"
+        data:
+          type: object
+          description: Message payload (arbitrary JSON object)
+          example:
+            task: "process_data"
+            priority: "high"
+        message_id:
+          type: string
+          description: Unique message identifier
+          example: "msg_12345"
+        timestamp:
+          type: number
+          format: float
+          description: Unix timestamp of message creation
+          example: 1730803200.5
+        priority:
+          type: integer
+          description: Optional message priority (higher = more important)
+          default: 0
+      example:
+        type: enqueue
+        queue_name: "task_queue"
+        data:
+          task: "process_data"
+          priority: "high"
+        message_id: "msg_12345"
+        timestamp: 1730803200.5
+
+    DequeueRequest:
+      type: object
+      required:
+        - type
+        - queue_name
+      properties:
+        type:
+          type: string
+          enum: [dequeue]
+          description: Message type identifier
+        queue_name:
+          type: string
+          description: Name of the queue to dequeue from
+          example: "task_queue"
+        timeout:
+          type: number
+          format: float
+          description: Maximum time to wait for a message (seconds)
+          default: 30.0
+      example:
+        type: dequeue
+        queue_name: "task_queue"
+        timeout: 30.0
+
+    QueueResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [enqueued, dequeued, empty, error]
+          description: Result of the queue operation
+        message:
+          type: object
+          description: Dequeued message (only for dequeue operations)
+          properties:
+            message_id:
+              type: string
+            data:
+              type: object
+            timestamp:
+              type: number
+              format: float
+        queue_name:
+          type: string
+          description: The queue name from the request
+      example:
+        status: dequeued
+        message:
+          message_id: "msg_12345"
+          data:
+            task: "process_data"
+            priority: "high"
+          timestamp: 1730803200.5
+        queue_name: "task_queue"
+
+    CachePut:
+      type: object
+      required:
+        - type
+        - key
+        - value
+      properties:
+        type:
+          type: string
+          enum: [cache_put]
+          description: Message type identifier
+        key:
+          type: string
+          description: Cache key
+          example: "user:123"
+        value:
+          type: object
+          description: Value to cache (arbitrary JSON object)
+          example:
+            name: "Alice"
+            age: 30
+            email: "alice@example.com"
+        ttl:
+          type: integer
+          description: Time to live in seconds (0 = no expiration)
+          default: 0
+      example:
+        type: cache_put
+        key: "user:123"
+        value:
+          name: "Alice"
+          age: 30
+          email: "alice@example.com"
+        ttl: 3600
+
+    CacheGet:
+      type: object
+      required:
+        - type
+        - key
+      properties:
+        type:
+          type: string
+          enum: [cache_get]
+          description: Message type identifier
+        key:
+          type: string
+          description: Cache key to retrieve
+          example: "user:123"
+      example:
+        type: cache_get
+        key: "user:123"
+
+    CacheDelete:
+      type: object
+      required:
+        - type
+        - key
+      properties:
+        type:
+          type: string
+          enum: [cache_delete]
+          description: Message type identifier
+        key:
+          type: string
+          description: Cache key to delete
+          example: "user:123"
+      example:
+        type: cache_delete
+        key: "user:123"
+
+    CacheResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [found, not_found, stored, deleted, invalidated]
+          description: Result of the cache operation
+        key:
+          type: string
+          description: The cache key from the request
+        value:
+          type: object
+          description: Cached value (only for successful get operations)
+        state:
+          type: string
+          enum: [M, E, S, I]
+          description: MESI cache state
+      example:
+        status: found
+        key: "user:123"
+        value:
+          name: "Alice"
+          age: 30
+          email: "alice@example.com"
+        state: S
+
+    AppendEntries:
+      type: object
+      required:
+        - type
+        - term
+        - leader_id
+        - prev_log_index
+        - prev_log_term
+        - entries
+        - leader_commit
+      properties:
+        type:
+          type: string
+          enum: [append_entries]
+          description: Raft AppendEntries RPC
+        term:
+          type: integer
+          description: Leader's current term
+        leader_id:
+          type: string
+          description: Leader's node ID
+        prev_log_index:
+          type: integer
+          description: Index of log entry immediately preceding new ones
+        prev_log_term:
+          type: integer
+          description: Term of prev_log_index entry
+        entries:
+          type: array
+          description: Log entries to store (empty for heartbeat)
+          items:
+            $ref: "#/components/schemas/LogEntry"
+        leader_commit:
+          type: integer
+          description: Leader's commit index
+      example:
+        type: append_entries
+        term: 5
+        leader_id: "lock-node-1"
+        prev_log_index: 42
+        prev_log_term: 4
+        entries: []
+        leader_commit: 40
+
+    RequestVote:
+      type: object
+      required:
+        - type
+        - term
+        - candidate_id
+        - last_log_index
+        - last_log_term
+      properties:
+        type:
+          type: string
+          enum: [request_vote]
+          description: Raft RequestVote RPC
+        term:
+          type: integer
+          description: Candidate's current term
+        candidate_id:
+          type: string
+          description: Candidate requesting vote
+        last_log_index:
+          type: integer
+          description: Index of candidate's last log entry
+        last_log_term:
+          type: integer
+          description: Term of candidate's last log entry
+      example:
+        type: request_vote
+        term: 6
+        candidate_id: "lock-node-2"
+        last_log_index: 43
+        last_log_term: 5
+
+    LogEntry:
+      type: object
+      properties:
+        term:
+          type: integer
+          description: Term when entry was received by leader
+        index:
+          type: integer
+          description: Position in the log
+        command:
+          type: object
+          description: State machine command
+      example:
+        term: 5
+        index: 43
+        command:
+          type: lock_request
+          lock_id: "resource_1"
+
+    RaftResponse:
+      type: object
+      properties:
+        term:
+          type: integer
+          description: Current term for candidate to update itself
+        success:
+          type: boolean
+          description: True if operation succeeded
+        vote_granted:
+          type: boolean
+          description: True if vote was granted (RequestVote only)
+        leader_id:
+          type: string
+          description: Current leader node ID (if known)
+      example:
+        term: 5
+        success: true
+        vote_granted: true
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Error message
+        code:
+          type: string
+          description: Error code
+        details:
+          type: object
+          description: Additional error details
+      example:
+        error: "Not the leader"
+        code: "NOT_LEADER"
+        details:
+          leader_id: "lock-node-1"
+          leader_url: "http://localhost:8001"
+
+  securitySchemes: {}
+
+security: []
+
+externalDocs:
+  description: Full documentation and architecture details
+  url: https://github.com/yourusername/synaxis/tree/main/docs

@@ -1,0 +1,31 @@
+[project]
+name = "Synaxis"
+version = "0.1.0"
+description = "Distributed Synchronization System"
+readme = "README.md"
+
+requires-python = ">=3.14"
+dependencies = [
+    "aiohttp[speedups]>=3.13.2",
+    "environs>=14.4.0",
+    "loguru>=0.7.3",
+    "orjson>=3.11.4",
+    "ormsgpack>=1.11.0",
+    "pyzmq>=27.1.0",
+    "redis[hiredis]>=7.0.1",
+]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.32.1",
+    "locust>=2.42.1",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
+    "ruff>=0.14.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
