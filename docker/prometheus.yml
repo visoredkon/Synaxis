@@ -1,0 +1,25 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "lock-managers"
+    static_configs:
+      - targets:
+          - "lock-manager-1:9090"
+          - "lock-manager-2:9091"
+          - "lock-manager-3:9092"
+
+  - job_name: "queue-nodes"
+    static_configs:
+      - targets:
+          - "queue-1:9100"
+          - "queue-2:9101"
+          - "queue-3:9102"
+
+  - job_name: "cache-nodes"
+    static_configs:
+      - targets:
+          - "cache-1:9200"
+          - "cache-2:9201"
+          - "cache-3:9202"

@@ -1,122 +1,91 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from pathlib import Path
+from os import getenv
+from typing import TYPE_CHECKING
 
-from environs import Env
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class NodeConfig:
     node_id: str
     host: str
     port: int
+    redis_url: str = "redis://localhost:6379"
+    election_timeout_min: int = 150
+    election_timeout_max: int = 300
+    heartbeat_interval: int = 50
+    request_timeout: float = 5.0
+    max_retries: int = 3
+    consensus_type: str = "raft"
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class ClusterConfig:
-    nodes: list[NodeConfig]
-
-    @classmethod
-    def from_string(cls, nodes_str: str) -> "ClusterConfig":
-        nodes = []
-        for node_str in nodes_str.split(","):
-            node_str = node_str.strip()
-            if ":" in node_str:
-                host, port_str = node_str.split(":", 1)
-                nodes.append(NodeConfig(node_id=host, host=host, port=int(port_str)))
-        return cls(nodes=nodes)
+    nodes: tuple[NodeConfig, ...]
+    replication_factor: int = 3
+    min_quorum: int = 2
 
 
-@dataclass
-class RedisConfig:
-    host: str
-    port: int
-    db: int
-
-
-@dataclass
-class RaftConfig:
-    election_timeout_min: int
-    election_timeout_max: int
-    heartbeat_interval: int
-
-
-@dataclass
-class CacheConfig:
-    size: int
-
-
-@dataclass
-class QueueConfig:
-    partitions: int
-
-
-@dataclass
-class LockConfig:
-    timeout: int
-
-
-@dataclass
-class SynaxisConfig:
+@dataclass(slots=True)
+class Config:
     node: NodeConfig
     cluster: ClusterConfig
-    redis: RedisConfig
-    raft: RaftConfig
-    cache: CacheConfig
-    queue: QueueConfig
-    lock: LockConfig
-    log_level: str
+    metrics_port: int = 9090
+    log_level: str = "INFO"
 
     @classmethod
-    def from_env(cls, env_file: Path | None = None) -> "SynaxisConfig":
-        env = Env()
-        if env_file:
-            env.read_env(str(env_file))
-        node_id = env.str("NODE_ID", "node1")
-        node_host = env.str("NODE_HOST", "0.0.0.0")
-        node_port = env.int("NODE_PORT", 8000)
-        cluster_nodes_str = env.str("CLUSTER_NODES", "node1:8000,node2:8001,node3:8002")
-        cluster = ClusterConfig.from_string(cluster_nodes_str)
-        redis_host = env.str("REDIS_HOST", "localhost")
-        redis_port = env.int("REDIS_PORT", 6379)
-        redis_db = env.int("REDIS_DB", 0)
-        raft_election_timeout_min = env.int("RAFT_ELECTION_TIMEOUT_MIN", 150)
-        raft_election_timeout_max = env.int("RAFT_ELECTION_TIMEOUT_MAX", 300)
-        raft_heartbeat_interval = env.int("RAFT_HEARTBEAT_INTERVAL", 50)
-        cache_size = env.int("CACHE_SIZE", 1000)
-        queue_partitions = env.int("QUEUE_PARTITIONS", 16)
-        lock_timeout = env.int("LOCK_TIMEOUT", 30)
-        log_level = env.str("LOG_LEVEL", "INFO")
-        return cls(
-            node=NodeConfig(node_id=node_id, host=node_host, port=node_port),
-            cluster=cluster,
-            redis=RedisConfig(host=redis_host, port=redis_port, db=redis_db),
-            raft=RaftConfig(
-                election_timeout_min=raft_election_timeout_min,
-                election_timeout_max=raft_election_timeout_max,
-                heartbeat_interval=raft_heartbeat_interval,
-            ),
-            cache=CacheConfig(size=cache_size),
-            queue=QueueConfig(partitions=queue_partitions),
-            lock=LockConfig(timeout=lock_timeout),
-            log_level=log_level,
+    def from_env(cls) -> Config:
+        node_id = getenv("NODE_ID", "node-1")
+        host = getenv("NODE_HOST", "0.0.0.0")
+        port = int(getenv("NODE_PORT", "8000"))
+        redis_url = getenv("REDIS_URL", "redis://localhost:6379")
+        consensus_type = getenv("CONSENSUS_TYPE", "raft")
+
+        node = NodeConfig(
+            node_id=node_id,
+            host=host,
+            port=port,
+            redis_url=redis_url,
+            election_timeout_min=int(getenv("ELECTION_TIMEOUT_MIN", "150")),
+            election_timeout_max=int(getenv("ELECTION_TIMEOUT_MAX", "300")),
+            heartbeat_interval=int(getenv("HEARTBEAT_INTERVAL", "50")),
+            request_timeout=float(getenv("REQUEST_TIMEOUT", "5.0")),
+            max_retries=int(getenv("MAX_RETRIES", "3")),
+            consensus_type=consensus_type,
         )
 
+        cluster_nodes_str = getenv("CLUSTER_NODES", "")
+        cluster_nodes: list[NodeConfig] = []
+        if cluster_nodes_str:
+            for node_spec in cluster_nodes_str.split(","):
+                parts = node_spec.strip().split(":")
+                if len(parts) == 2:
+                    n_id, n_port = parts[0], int(parts[1])
+                    cluster_nodes.append(
+                        NodeConfig(
+                            node_id=n_id,
+                            host=n_id,
+                            port=n_port,
+                            redis_url=redis_url,
+                            consensus_type=consensus_type,
+                        )
+                    )
 
-def get_config() -> SynaxisConfig:
-    env_file = Path(".env")
-    if env_file.exists():
-        return SynaxisConfig.from_env(env_file)
-    return SynaxisConfig.from_env()
+        cluster = ClusterConfig(
+            nodes=tuple(cluster_nodes),
+            replication_factor=int(getenv("REPLICATION_FACTOR", "3")),
+            min_quorum=int(getenv("MIN_QUORUM", "2")),
+        )
 
+        return cls(
+            node=node,
+            cluster=cluster,
+            metrics_port=int(getenv("METRICS_PORT", "9090")),
+            log_level=getenv("LOG_LEVEL", "INFO"),
+        )
 
-__all__ = [
-    "SynaxisConfig",
-    "NodeConfig",
-    "ClusterConfig",
-    "RedisConfig",
-    "RaftConfig",
-    "CacheConfig",
-    "QueueConfig",
-    "LockConfig",
-    "get_config",
-]
+    def get_peer_nodes(self) -> Sequence[NodeConfig]:
+        return [n for n in self.cluster.nodes if n.node_id != self.node.node_id]

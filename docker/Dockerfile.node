@@ -1,0 +1,33 @@
+FROM astral/uv:0.9-python3.12-bookworm-slim AS builder
+
+WORKDIR /app
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
+
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-install-project
+
+COPY src/ ./src/
+
+FROM python:3.12-slim-bookworm AS runtime
+
+WORKDIR /app
+
+RUN adduser --disabled-password --gecos "" --no-create-home appuser && \
+    mkdir -p /app/data && \
+    chown -R appuser:appuser /app
+
+COPY --from=builder --chown=appuser:appuser /app/.venv /app/.venv
+COPY --from=builder --chown=appuser:appuser /app/src /app/src
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONPATH="/app" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+USER appuser
+
+EXPOSE 8000 9090
+
+ENTRYPOINT ["python", "-m", "src.main"]

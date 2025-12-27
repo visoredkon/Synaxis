@@ -1,190 +1,321 @@
 services:
   redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    networks:
-      - synaxis-net
+    image: redis:8-bookworm
+    container_name: synaxis-redis
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
+    restart: unless-stopped
+    networks:
+      - synaxis-network
 
-  lock-node-1:
+  lock-manager-1:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.lock
+      dockerfile: docker/Dockerfile.node
+    container_name: synaxis-lock-manager-1
     environment:
-      - NODE_ID=lock-node-1
-      - NODE_HOST=0.0.0.0
-      - NODE_PORT=8001
-      - CLUSTER_NODES=lock-node-1:8001,lock-node-2:8002,lock-node-3:8003
-      - REDIS_HOST=redis
-      - RAFT_ELECTION_TIMEOUT_MIN=2000
-      - RAFT_ELECTION_TIMEOUT_MAX=10000
-      - RAFT_HEARTBEAT_INTERVAL=500
-      - LOG_LEVEL=DEBUG
+      NODE_ID: lock-1
+      NODE_HOST: "0.0.0.0"
+      NODE_PORT: "8000"
+      REDIS_URL: redis://redis:6379
+      CLUSTER_NODES: lock-manager-1:8000,lock-manager-2:8001,lock-manager-3:8002
+      CONSENSUS_TYPE: ${CONSENSUS_TYPE:-raft}
+      NODE_TYPE: lock_manager
+      METRICS_PORT: "9090"
     ports:
-      - "8001:8001"
-    networks:
-      - synaxis-net
+      - "18000:8000"
+      - "19090:9090"
     depends_on:
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - synaxis-network
 
-  lock-node-2:
+  lock-manager-2:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.lock
+      dockerfile: docker/Dockerfile.node
+    container_name: synaxis-lock-manager-2
     environment:
-      - NODE_ID=lock-node-2
-      - NODE_HOST=0.0.0.0
-      - NODE_PORT=8002
-      - CLUSTER_NODES=lock-node-1:8001,lock-node-2:8002,lock-node-3:8003
-      - REDIS_HOST=redis
-      - RAFT_ELECTION_TIMEOUT_MIN=2000
-      - RAFT_ELECTION_TIMEOUT_MAX=10000
-      - RAFT_HEARTBEAT_INTERVAL=500
-      - LOG_LEVEL=DEBUG
+      NODE_ID: lock-2
+      NODE_HOST: "0.0.0.0"
+      NODE_PORT: "8001"
+      REDIS_URL: redis://redis:6379
+      CLUSTER_NODES: lock-manager-1:8000,lock-manager-2:8001,lock-manager-3:8002
+      CONSENSUS_TYPE: ${CONSENSUS_TYPE:-raft}
+      NODE_TYPE: lock_manager
+      METRICS_PORT: "9091"
     ports:
-      - "8002:8002"
-    networks:
-      - synaxis-net
+      - "18001:8001"
+      - "19091:9091"
     depends_on:
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - synaxis-network
 
-  lock-node-3:
+  lock-manager-3:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.lock
+      dockerfile: docker/Dockerfile.node
+    container_name: synaxis-lock-manager-3
     environment:
-      - NODE_ID=lock-node-3
-      - NODE_HOST=0.0.0.0
-      - NODE_PORT=8003
-      - CLUSTER_NODES=lock-node-1:8001,lock-node-2:8002,lock-node-3:8003
-      - REDIS_HOST=redis
-      - RAFT_ELECTION_TIMEOUT_MIN=2000
-      - RAFT_ELECTION_TIMEOUT_MAX=10000
-      - RAFT_HEARTBEAT_INTERVAL=500
-      - LOG_LEVEL=DEBUG
+      NODE_ID: lock-3
+      NODE_HOST: "0.0.0.0"
+      NODE_PORT: "8002"
+      REDIS_URL: redis://redis:6379
+      CLUSTER_NODES: lock-manager-1:8000,lock-manager-2:8001,lock-manager-3:8002
+      CONSENSUS_TYPE: ${CONSENSUS_TYPE:-raft}
+      NODE_TYPE: lock_manager
+      METRICS_PORT: "9092"
     ports:
-      - "8003:8003"
-    networks:
-      - synaxis-net
+      - "18002:8002"
+      - "19092:9092"
     depends_on:
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - synaxis-network
 
-  queue-node-1:
+  queue-1:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.queue
+      dockerfile: docker/Dockerfile.node
+    container_name: synaxis-queue-1
     environment:
-      - NODE_ID=queue-node-1
-      - NODE_HOST=0.0.0.0
-      - NODE_PORT=8011
-      - CLUSTER_NODES=queue-node-1:8011,queue-node-2:8012,queue-node-3:8013
-      - REDIS_HOST=redis
-      - QUEUE_PARTITIONS=16
-      - LOG_LEVEL=DEBUG
+      NODE_ID: queue-1
+      NODE_HOST: "0.0.0.0"
+      NODE_PORT: "8100"
+      REDIS_URL: redis://redis:6379
+      CLUSTER_NODES: queue-1:8100,queue-2:8101,queue-3:8102
+      NODE_TYPE: queue_node
+      METRICS_PORT: "9100"
     ports:
-      - "8011:8011"
-    networks:
-      - synaxis-net
+      - "18100:8100"
+      - "19100:9100"
     depends_on:
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - synaxis-network
 
-  queue-node-2:
+  queue-2:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.queue
+      dockerfile: docker/Dockerfile.node
+    container_name: synaxis-queue-2
     environment:
-      - NODE_ID=queue-node-2
-      - NODE_HOST=0.0.0.0
-      - NODE_PORT=8012
-      - CLUSTER_NODES=queue-node-1:8011,queue-node-2:8012,queue-node-3:8013
-      - REDIS_HOST=redis
-      - QUEUE_PARTITIONS=16
-      - LOG_LEVEL=DEBUG
+      NODE_ID: queue-2
+      NODE_HOST: "0.0.0.0"
+      NODE_PORT: "8101"
+      REDIS_URL: redis://redis:6379
+      CLUSTER_NODES: queue-1:8100,queue-2:8101,queue-3:8102
+      NODE_TYPE: queue_node
+      METRICS_PORT: "9101"
     ports:
-      - "8012:8012"
-    networks:
-      - synaxis-net
+      - "18101:8101"
+      - "19101:9101"
     depends_on:
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8101/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - synaxis-network
 
-  queue-node-3:
+  queue-3:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.queue
+      dockerfile: docker/Dockerfile.node
+    container_name: synaxis-queue-3
     environment:
-      - NODE_ID=queue-node-3
-      - NODE_HOST=0.0.0.0
-      - NODE_PORT=8013
-      - CLUSTER_NODES=queue-node-1:8011,queue-node-2:8012,queue-node-3:8013
-      - REDIS_HOST=redis
-      - QUEUE_PARTITIONS=16
-      - LOG_LEVEL=DEBUG
+      NODE_ID: queue-3
+      NODE_HOST: "0.0.0.0"
+      NODE_PORT: "8102"
+      REDIS_URL: redis://redis:6379
+      CLUSTER_NODES: queue-1:8100,queue-2:8101,queue-3:8102
+      NODE_TYPE: queue_node
+      METRICS_PORT: "9102"
     ports:
-      - "8013:8013"
-    networks:
-      - synaxis-net
+      - "18102:8102"
+      - "19102:9102"
     depends_on:
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8102/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - synaxis-network
 
-  cache-node-1:
+  cache-1:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.cache
+      dockerfile: docker/Dockerfile.node
+    container_name: synaxis-cache-1
     environment:
-      - NODE_ID=cache-node-1
-      - NODE_HOST=0.0.0.0
-      - NODE_PORT=8021
-      - CLUSTER_NODES=cache-node-1:8021,cache-node-2:8022,cache-node-3:8023
-      - CACHE_SIZE=1000
-      - LOG_LEVEL=DEBUG
+      NODE_ID: cache-1
+      NODE_HOST: "0.0.0.0"
+      NODE_PORT: "8200"
+      REDIS_URL: redis://redis:6379
+      CLUSTER_NODES: cache-1:8200,cache-2:8201,cache-3:8202
+      NODE_TYPE: cache_node
+      METRICS_PORT: "9200"
     ports:
-      - "8021:8021"
+      - "18200:8200"
+      - "19200:9200"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8200/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
     networks:
-      - synaxis-net
+      - synaxis-network
 
-  cache-node-2:
+  cache-2:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.cache
+      dockerfile: docker/Dockerfile.node
+    container_name: synaxis-cache-2
     environment:
-      - NODE_ID=cache-node-2
-      - NODE_HOST=0.0.0.0
-      - NODE_PORT=8022
-      - CLUSTER_NODES=cache-node-1:8021,cache-node-2:8022,cache-node-3:8023
-      - CACHE_SIZE=1000
-      - LOG_LEVEL=DEBUG
+      NODE_ID: cache-2
+      NODE_HOST: "0.0.0.0"
+      NODE_PORT: "8201"
+      REDIS_URL: redis://redis:6379
+      CLUSTER_NODES: cache-1:8200,cache-2:8201,cache-3:8202
+      NODE_TYPE: cache_node
+      METRICS_PORT: "9201"
     ports:
-      - "8022:8022"
+      - "18201:8201"
+      - "19201:9201"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8201/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
     networks:
-      - synaxis-net
+      - synaxis-network
 
-  cache-node-3:
+  cache-3:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.cache
+      dockerfile: docker/Dockerfile.node
+    container_name: synaxis-cache-3
     environment:
-      - NODE_ID=cache-node-3
-      - NODE_HOST=0.0.0.0
-      - NODE_PORT=8023
-      - CLUSTER_NODES=cache-node-1:8021,cache-node-2:8022,cache-node-3:8023
-      - CACHE_SIZE=1000
-      - LOG_LEVEL=DEBUG
+      NODE_ID: cache-3
+      NODE_HOST: "0.0.0.0"
+      NODE_PORT: "8202"
+      REDIS_URL: redis://redis:6379
+      CLUSTER_NODES: cache-1:8200,cache-2:8201,cache-3:8202
+      NODE_TYPE: cache_node
+      METRICS_PORT: "9202"
     ports:
-      - "8023:8023"
+      - "18202:8202"
+      - "19202:9202"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8202/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
     networks:
-      - synaxis-net
+      - synaxis-network
+
+  prometheus:
+    image: prom/prometheus:v3.4.0
+    container_name: synaxis-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+    networks:
+      - synaxis-network
+    profiles:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    container_name: synaxis-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - synaxis-network
+    profiles:
+      - monitoring
 
 networks:
-  synaxis-net:
+  synaxis-network:
     driver: bridge
+
+volumes:
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local

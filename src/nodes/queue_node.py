@@ -1,345 +1,399 @@
-import asyncio
-import bisect
-import hashlib
-import time
-from collections import deque
-from dataclasses import dataclass, field
-from enum import Enum
+from __future__ import annotations
 
-import redis.asyncio as aioredis
+from asyncio import CancelledError, Task, create_task, get_event_loop, sleep
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import TYPE_CHECKING, Any
+from uuid import uuid4
+
 from loguru import logger
 
-from .base_node import BaseNode
+from src.communication.message_passing import Message, MessageType
+from src.nodes.base_node import BaseNode, NodeRole
+from src.utils.config import Config
+from src.utils.consistent_hash import ConsistentHash
+from src.utils.metrics import MetricsCollector, Timer
+
+if TYPE_CHECKING:
+    pass
 
 
-class MessageStatus(Enum):
-    PENDING = "pending"
-    IN_FLIGHT = "in_flight"
-    DELIVERED = "delivered"
-    FAILED = "failed"
+class DeliveryGuarantee(Enum):
+    AT_MOST_ONCE = auto()
+    AT_LEAST_ONCE = auto()
+    EXACTLY_ONCE = auto()
 
 
-@dataclass
+class MessageState(Enum):
+    PENDING = auto()
+    DELIVERED = auto()
+    ACKNOWLEDGED = auto()
+    DEAD_LETTER = auto()
+
+
+@dataclass(slots=True)
 class QueueMessage:
     message_id: str
-    data: object
+    topic: str
+    payload: bytes
+    partition: int
+    offset: int
     timestamp: float
-    status: MessageStatus = MessageStatus.PENDING
-    retry_count: int = 0
-    max_retries: int = 3
+    state: MessageState = MessageState.PENDING
+    delivery_count: int = 0
+    consumer_id: str | None = None
+    ack_deadline: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "message_id": self.message_id,
+            "topic": self.topic,
+            "payload": self.payload,
+            "partition": self.partition,
+            "offset": self.offset,
+            "timestamp": self.timestamp,
+            "state": self.state.value,
+            "delivery_count": self.delivery_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> QueueMessage:
+        return cls(
+            message_id=data["message_id"],
+            topic=data["topic"],
+            payload=data["payload"],
+            partition=data["partition"],
+            offset=data["offset"],
+            timestamp=data["timestamp"],
+            state=MessageState(data["state"]),
+            delivery_count=data.get("delivery_count", 0),
+        )
 
 
-@dataclass
-class ConsistentHashRing:
-    nodes: list[str] = field(default_factory=list)
-    virtual_nodes: int = 150
-    ring: dict[int, str] = field(default_factory=dict)
-    _sorted_keys: list[int] = field(default_factory=list)
+@dataclass(slots=True)
+class ConsumerGroup:
+    group_id: str
+    topic: str
+    consumers: dict[str, set[int]] = field(default_factory=dict)
+    offsets: dict[int, int] = field(default_factory=dict)
 
-    def add_node(self, node: str) -> None:
-        for i in range(self.virtual_nodes):
-            key = f"{node}:{i}"
-            hash_value = self._hash(key)
-            self.ring[hash_value] = node
-        self.nodes.append(node)
-        self._sorted_keys = sorted(self.ring.keys())
-        logger.debug(f"Added node {node} to hash ring")
 
-    def remove_node(self, node: str) -> None:
-        for i in range(self.virtual_nodes):
-            key = f"{node}:{i}"
-            hash_value = self._hash(key)
-            if hash_value in self.ring:
-                del self.ring[hash_value]
-        if node in self.nodes:
-            self.nodes.remove(node)
-        self._sorted_keys = sorted(self.ring.keys())
-        logger.debug(f"Removed node {node} from hash ring")
-
-    def get_node(self, key: str) -> str | None:
-        if not self._sorted_keys:
-            return None
-        hash_value = self._hash(key)
-        idx = bisect.bisect_right(self._sorted_keys, hash_value)
-        if idx == len(self._sorted_keys):
-            idx = 0
-        return self.ring[self._sorted_keys[idx]]
-
-    def _hash(self, key: str) -> int:
-        return int(hashlib.md5(key.encode()).hexdigest(), 16)
+@dataclass(slots=True)
+class TopicPartition:
+    topic: str
+    partition: int
+    messages: deque[QueueMessage] = field(default_factory=deque)
+    next_offset: int = 0
+    committed_offset: int = 0
 
 
 class QueueNode(BaseNode):
-    redis_url: str
-    partitions: int
-    redis: aioredis.Redis | None
-    hash_ring: ConsistentHashRing
-    local_queues: dict[str, deque[QueueMessage]]
-    in_flight: dict[str, QueueMessage]
-    _consumer_task: asyncio.Task[None] | None
-    _persistence_task: asyncio.Task[None] | None
-
     def __init__(
         self,
-        node_id: str,
-        host: str,
-        port: int,
-        cluster_nodes: list[str],
-        redis_url: str = "redis://localhost:6379",
-        partitions: int = 16,
+        config: Config,
+        num_partitions: int = 3,
+        max_delivery_attempts: int = 5,
+        ack_timeout: float = 30.0,
+        delivery_guarantee: DeliveryGuarantee = DeliveryGuarantee.AT_LEAST_ONCE,
     ) -> None:
-        super().__init__(node_id, host, port, cluster_nodes)
-        self.redis_url = redis_url
-        self.partitions = partitions
-        self.redis = None
-        self.hash_ring = ConsistentHashRing()
-        self.local_queues = {}
-        self.in_flight = {}
-        self._consumer_task = None
-        self._persistence_task = None
+        super().__init__(config, NodeRole.QUEUE_NODE)
+        self._num_partitions = num_partitions
+        self._max_delivery_attempts = max_delivery_attempts
+        self._ack_timeout = ack_timeout
+        self._delivery_guarantee = delivery_guarantee
 
-    async def start(self) -> None:
-        await super().start()
-        self.redis = await aioredis.from_url(self.redis_url, decode_responses=False)
-        for node in self.cluster_nodes:
-            self.hash_ring.add_node(node)
-        for i in range(self.partitions):
-            partition_name = f"partition_{i}"
-            self.local_queues[partition_name] = deque()
-        await self._recover_messages()
-        self.message_passing.register_handler("enqueue", self._handle_enqueue)
-        self.message_passing.register_handler("dequeue", self._handle_dequeue)
-        self.message_passing.register_handler("ack", self._handle_ack)
-        self._consumer_task = asyncio.create_task(self._consumer_loop())
-        self._persistence_task = asyncio.create_task(self._persistence_loop())
-        logger.info(
-            f"Queue node {self.node_id} started with {self.partitions} partitions"
+        self._consistent_hash = ConsistentHash()
+        self._partitions: dict[str, dict[int, TopicPartition]] = defaultdict(dict)
+        self._consumer_groups: dict[str, ConsumerGroup] = {}
+        self._pending_acks: dict[str, QueueMessage] = {}
+        self._wal: list[QueueMessage] = []
+
+        self._redelivery_task: Task[None] | None = None
+        self._metrics = MetricsCollector()
+
+    async def _on_start(self) -> None:
+        self._consistent_hash.add_node(self.node_id)
+        for peer in self._config.get_peer_nodes():
+            self._consistent_hash.add_node(peer.node_id)
+
+        await self._recover_from_wal()
+        self._redelivery_task = create_task(self._redelivery_loop())
+        logger.info(f"Queue node started with {self._num_partitions} partitions")
+
+    async def _on_stop(self) -> None:
+        if self._redelivery_task:
+            self._redelivery_task.cancel()
+            try:
+                await self._redelivery_task
+            except CancelledError:
+                pass
+        await self._persist_to_wal()
+
+    def _register_handlers(self) -> None:
+        super()._register_handlers()
+        self._message_bus.register_handler(
+            MessageType.QUEUE_PUBLISH,
+            self._handle_publish,
+        )
+        self._message_bus.register_handler(
+            MessageType.QUEUE_CONSUME,
+            self._handle_consume,
+        )
+        self._message_bus.register_handler(
+            MessageType.QUEUE_ACK,
+            self._handle_ack,
         )
 
-    async def stop(self) -> None:
-        if self._consumer_task:
-            self._consumer_task.cancel()
-            try:
-                await self._consumer_task
-            except asyncio.CancelledError:
-                pass
-        if self._persistence_task:
-            self._persistence_task.cancel()
-            try:
-                await self._persistence_task
-            except asyncio.CancelledError:
-                pass
-        if self.redis:
-            await self.redis.close()
-        await super().stop()
-        logger.info(f"Queue node {self.node_id} stopped")
+    def _get_partition_for_key(self, topic: str, key: str | None = None) -> int:
+        if key:
+            node = self._consistent_hash.get_node(key)
+            if node:
+                h = hash(node)
+                return h % self._num_partitions
+        return hash(topic + str(uuid4())) % self._num_partitions
 
-    async def enqueue(self, queue_name: str, data: object) -> bool:
-        self.metrics.start_timer("enqueue")
-        message_id = f"{self.node_id}:{time.time()}:{id(data)}"
-        message = QueueMessage(message_id=message_id, data=data, timestamp=time.time())
-        target_node = self.hash_ring.get_node(queue_name)
-        if not target_node:
-            logger.error("No node available in hash ring")
-            return False
-        if target_node == self.node_id:
-            success = await self._enqueue_local(queue_name, message)
-        else:
-            success = await self._enqueue_remote(target_node, queue_name, message)
-        self.metrics.stop_timer("enqueue")
-        if success:
-            self.metrics.increment_counter("messages_enqueued")
-        else:
-            self.metrics.increment_counter("enqueue_failed")
-        return success
+    def _get_or_create_partition(self, topic: str, partition: int) -> TopicPartition:
+        if partition not in self._partitions[topic]:
+            self._partitions[topic][partition] = TopicPartition(
+                topic=topic,
+                partition=partition,
+            )
+        return self._partitions[topic][partition]
 
-    async def dequeue(self, queue_name: str, timeout: float = 5.0) -> object | None:
-        self.metrics.start_timer("dequeue")
-        target_node = self.hash_ring.get_node(queue_name)
-        if not target_node:
-            return None
-        if target_node == self.node_id:
-            message = await self._dequeue_local(queue_name, timeout)
-        else:
-            message = await self._dequeue_remote(target_node, queue_name, timeout)
-        self.metrics.stop_timer("dequeue")
-        if message:
-            self.metrics.increment_counter("messages_dequeued")
-        else:
-            self.metrics.increment_counter("dequeue_timeout")
-        return message.data if message else None
+    async def publish(
+        self,
+        topic: str,
+        payload: bytes,
+        key: str | None = None,
+    ) -> str:
+        partition_id = self._get_partition_for_key(topic, key)
+        partition = self._get_or_create_partition(topic, partition_id)
+
+        message = QueueMessage(
+            message_id=str(uuid4()),
+            topic=topic,
+            payload=payload,
+            partition=partition_id,
+            offset=partition.next_offset,
+            timestamp=get_event_loop().time(),
+        )
+
+        partition.messages.append(message)
+        partition.next_offset += 1
+
+        self._wal.append(message)
+
+        self._metrics.record_queue_size(
+            self.node_id,
+            topic,
+            len(partition.messages),
+        )
+
+        logger.debug(
+            f"Published message {message.message_id} to {topic}:{partition_id}"
+        )
+        return message.message_id
+
+    async def subscribe(
+        self,
+        topic: str,
+        consumer_group: str,
+        consumer_id: str,
+    ) -> None:
+        if consumer_group not in self._consumer_groups:
+            self._consumer_groups[consumer_group] = ConsumerGroup(
+                group_id=consumer_group,
+                topic=topic,
+            )
+
+        group = self._consumer_groups[consumer_group]
+        if consumer_id not in group.consumers:
+            group.consumers[consumer_id] = set()
+
+        self._rebalance_partitions(group)
+        logger.info(f"Consumer {consumer_id} subscribed to {topic}")
+
+    def _rebalance_partitions(self, group: ConsumerGroup) -> None:
+        if not group.consumers:
+            return
+
+        consumer_ids = list(group.consumers.keys())
+        for consumer_id in consumer_ids:
+            group.consumers[consumer_id] = set()
+
+        for partition_id in range(self._num_partitions):
+            consumer_idx = partition_id % len(consumer_ids)
+            consumer_id = consumer_ids[consumer_idx]
+            group.consumers[consumer_id].add(partition_id)
+
+    async def consume(
+        self,
+        topic: str,
+        consumer_group: str,
+        consumer_id: str,
+        max_messages: int = 10,
+    ) -> list[QueueMessage]:
+        if consumer_group not in self._consumer_groups:
+            return []
+
+        group = self._consumer_groups[consumer_group]
+        if consumer_id not in group.consumers:
+            return []
+
+        assigned_partitions = group.consumers[consumer_id]
+        messages: list[QueueMessage] = []
+        now = get_event_loop().time()
+
+        for partition_id in assigned_partitions:
+            if len(messages) >= max_messages:
+                break
+
+            partition = self._partitions.get(topic, {}).get(partition_id)
+            if not partition:
+                continue
+
+            offset = group.offsets.get(partition_id, 0)
+
+            for msg in partition.messages:
+                if len(messages) >= max_messages:
+                    break
+                if msg.offset < offset:
+                    continue
+                if msg.state == MessageState.ACKNOWLEDGED:
+                    continue
+                if msg.state == MessageState.DELIVERED and msg.ack_deadline > now:
+                    continue
+                if msg.delivery_count >= self._max_delivery_attempts:
+                    msg.state = MessageState.DEAD_LETTER
+                    continue
+
+                msg.state = MessageState.DELIVERED
+                msg.consumer_id = consumer_id
+                msg.delivery_count += 1
+                msg.ack_deadline = now + self._ack_timeout
+                self._pending_acks[msg.message_id] = msg
+                messages.append(msg)
+
+        return messages
 
     async def acknowledge(self, message_id: str) -> bool:
-        if message_id in self.in_flight:
-            message = self.in_flight.pop(message_id)
-            message.status = MessageStatus.DELIVERED
-            await self._persist_message(message)
-            self.metrics.increment_counter("messages_acked")
-            return True
-        logger.warning(f"Attempted to ack unknown message {message_id}")
-        return False
+        if message_id not in self._pending_acks:
+            return False
 
-    async def _enqueue_local(self, queue_name: str, message: QueueMessage) -> bool:
-        partition = self._get_partition(queue_name)
-        self.local_queues[partition].append(message)
-        await self._persist_message(message)
-        logger.debug(f"Enqueued message {message.message_id} to {partition}")
+        msg = self._pending_acks.pop(message_id)
+        msg.state = MessageState.ACKNOWLEDGED
+
+        group_id = None
+        for gid, group in self._consumer_groups.items():
+            if group.topic == msg.topic:
+                group_id = gid
+                break
+
+        if group_id:
+            group = self._consumer_groups[group_id]
+            current = group.offsets.get(msg.partition, 0)
+            if msg.offset >= current:
+                group.offsets[msg.partition] = msg.offset + 1
+
+        logger.debug(f"Acknowledged message {message_id}")
         return True
 
-    async def _dequeue_local(
-        self, queue_name: str, timeout: float
-    ) -> QueueMessage | None:
-        partition = self._get_partition(queue_name)
-        queue = self.local_queues[partition]
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            if queue:
-                message = queue.popleft()
-                message.status = MessageStatus.IN_FLIGHT
-                self.in_flight[message.message_id] = message
-                await self._persist_message(message)
-                logger.debug(f"Dequeued message {message.message_id} from {partition}")
-                return message
-            await asyncio.sleep(0.1)
-        return None
+    async def _redelivery_loop(self) -> None:
+        while True:
+            await sleep(1.0)
+            now = get_event_loop().time()
 
-    async def _enqueue_remote(
-        self, target_node: str, queue_name: str, message: QueueMessage
-    ) -> bool:
-        logger.warning(f"Remote enqueue not fully implemented for node {target_node}")
-        return False
+            expired = [
+                msg_id
+                for msg_id, msg in self._pending_acks.items()
+                if msg.ack_deadline < now
+            ]
 
-    async def _dequeue_remote(
-        self, target_node: str, queue_name: str, timeout: float
-    ) -> QueueMessage | None:
-        logger.warning(f"Remote dequeue not fully implemented for node {target_node}")
-        return None
+            for msg_id in expired:
+                msg = self._pending_acks.pop(msg_id)
+                msg.state = MessageState.PENDING
+                logger.warning(
+                    f"Message {msg_id} redelivery scheduled (attempt {msg.delivery_count})"
+                )
 
-    async def _handle_enqueue(self, message: dict[str, object]) -> dict[str, object]:
-        queue_name_obj = message.get("queue_name", "")
-        queue_name = str(queue_name_obj) if isinstance(queue_name_obj, str) else ""
-        data = message.get("data")
-        success = False
-        if data is not None:
-            message_id_obj = message.get("message_id", "")
-            message_id = str(message_id_obj) if isinstance(message_id_obj, str) else ""
-            timestamp_obj = message.get("timestamp", time.time())
-            timestamp = (
-                float(timestamp_obj)
-                if isinstance(timestamp_obj, (int, float))
-                else time.time()
+    async def _persist_to_wal(self) -> None:
+        pass
+
+    async def _recover_from_wal(self) -> None:
+        pass
+
+    async def _handle_publish(self, message: Message) -> Message:
+        topic = message.payload["topic"]
+        payload = message.payload["payload"]
+        key = message.payload.get("key")
+
+        with Timer(
+            lambda t: self._metrics.record_request(
+                self.node_id, "queue_publish", "success", t
             )
-            msg = QueueMessage(message_id=message_id, data=data, timestamp=timestamp)
-            success = await self._enqueue_local(queue_name, msg)
-        return {"type": "enqueue_response", "success": success}
+        ):
+            message_id = await self.publish(topic, payload, key)
 
-    async def _handle_dequeue(self, message: dict[str, object]) -> dict[str, object]:
-        queue_name_obj = message.get("queue_name", "")
-        queue_name = str(queue_name_obj) if isinstance(queue_name_obj, str) else ""
-        timeout_obj = message.get("timeout", 5.0)
-        timeout = float(timeout_obj) if isinstance(timeout_obj, (int, float)) else 5.0
-        msg = await self._dequeue_local(queue_name, timeout)
+        return Message(
+            msg_type=MessageType.QUEUE_RESPONSE,
+            sender_id=self.node_id,
+            payload={"success": True, "message_id": message_id},
+        )
+
+    async def _handle_consume(self, message: Message) -> Message:
+        topic = message.payload["topic"]
+        consumer_group = message.payload["consumer_group"]
+        consumer_id = message.sender_id
+        max_messages = message.payload.get("max_messages", 10)
+
+        await self.subscribe(topic, consumer_group, consumer_id)
+        messages = await self.consume(topic, consumer_group, consumer_id, max_messages)
+
+        return Message(
+            msg_type=MessageType.QUEUE_RESPONSE,
+            sender_id=self.node_id,
+            payload={
+                "success": True,
+                "messages": [m.to_dict() for m in messages],
+            },
+        )
+
+    async def _handle_ack(self, message: Message) -> Message:
+        message_id = message.payload["message_id"]
+        success = await self.acknowledge(message_id)
+
+        return Message(
+            msg_type=MessageType.QUEUE_RESPONSE,
+            sender_id=self.node_id,
+            payload={"success": success},
+        )
+
+    def get_topic_info(self, topic: str) -> dict[str, Any]:
+        partitions = self._partitions.get(topic, {})
         return {
-            "type": "dequeue_response",
-            "message": msg.data if msg else None,
-            "message_id": msg.message_id if msg else None,
+            "topic": topic,
+            "partitions": len(partitions),
+            "total_messages": sum(len(p.messages) for p in partitions.values()),
+            "partition_info": {
+                pid: {
+                    "size": len(p.messages),
+                    "next_offset": p.next_offset,
+                    "committed_offset": p.committed_offset,
+                }
+                for pid, p in partitions.items()
+            },
         }
 
-    async def _handle_ack(self, message: dict[str, object]) -> dict[str, object]:
-        message_id_obj = message.get("message_id", "")
-        message_id = str(message_id_obj) if isinstance(message_id_obj, str) else ""
-        success = await self.acknowledge(message_id)
-        return {"type": "ack_response", "success": success}
-
-    def _get_partition(self, queue_name: str) -> str:
-        hash_value = int(hashlib.md5(queue_name.encode()).hexdigest(), 16)
-        partition_idx = hash_value % self.partitions
-        return f"partition_{partition_idx}"
-
-    async def _persist_message(self, message: QueueMessage) -> None:
-        if not self.redis:
-            return
-        try:
-            import orjson
-
-            key = f"message:{message.message_id}"
-            value = orjson.dumps(
-                {
-                    "message_id": message.message_id,
-                    "data": message.data,
-                    "timestamp": message.timestamp,
-                    "status": message.status.value,
-                    "retry_count": message.retry_count,
-                }
-            )
-            await self.redis.set(key, value)
-        except Exception as e:
-            logger.error(f"Error persisting message: {e}")
-
-    async def _recover_messages(self) -> None:
-        if not self.redis:
-            return
-        try:
-            import orjson
-
-            pattern = "message:*"
-            cursor = 0
-            recovered_count = 0
-            while True:
-                cursor, keys = await self.redis.scan(cursor, match=pattern, count=100)
-                for key in keys:
-                    value = await self.redis.get(key)
-                    if value:
-                        data = orjson.loads(value)
-                        message = QueueMessage(
-                            message_id=data["message_id"],
-                            data=data["data"],
-                            timestamp=data["timestamp"],
-                            status=MessageStatus(data["status"]),
-                            retry_count=data["retry_count"],
-                        )
-                        if message.status == MessageStatus.PENDING:
-                            queue_name = f"recovered_{recovered_count}"
-                            partition = self._get_partition(queue_name)
-                            self.local_queues[partition].append(message)
-                            recovered_count += 1
-                if cursor == 0:
-                    break
-            if recovered_count > 0:
-                logger.info(f"Recovered {recovered_count} messages from persistence")
-                self.metrics.increment_counter("messages_recovered", recovered_count)
-        except Exception as e:
-            logger.error(f"Error recovering messages: {e}")
-
-    async def _consumer_loop(self) -> None:
-        while self._running:
-            for message_id, message in list(self.in_flight.items()):
-                if time.time() - message.timestamp > 30.0:
-                    if message.retry_count < message.max_retries:
-                        message.retry_count += 1
-                        message.status = MessageStatus.PENDING
-                        self.in_flight.pop(message_id)
-                        partition = self._get_partition(message_id)
-                        self.local_queues[partition].append(message)
-                        logger.debug(f"Retrying message {message_id}")
-                        self.metrics.increment_counter("messages_retried")
-                    else:
-                        message.status = MessageStatus.FAILED
-                        self.in_flight.pop(message_id)
-                        await self._persist_message(message)
-                        logger.warning(f"Message {message_id} failed after max retries")
-                        self.metrics.increment_counter("messages_failed")
-            await asyncio.sleep(1.0)
-
-    async def _persistence_loop(self) -> None:
-        while self._running:
-            try:
-                for partition_name, queue in self.local_queues.items():
-                    self.metrics.set_gauge(f"queue_size_{partition_name}", len(queue))
-                self.metrics.set_gauge("in_flight_messages", len(self.in_flight))
-            except Exception as e:
-                logger.error(f"Error in persistence loop: {e}")
-            await asyncio.sleep(5.0)
-
-
-__all__ = ["QueueNode", "QueueMessage", "MessageStatus", "ConsistentHashRing"]
+    def get_consumer_group_info(self, group_id: str) -> dict[str, Any] | None:
+        group = self._consumer_groups.get(group_id)
+        if not group:
+            return None
+        return {
+            "group_id": group.group_id,
+            "topic": group.topic,
+            "consumers": {
+                cid: list(partitions) for cid, partitions in group.consumers.items()
+            },
+            "offsets": dict(group.offsets),
+        }

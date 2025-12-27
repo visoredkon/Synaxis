@@ -1,264 +1,125 @@
-import time
+from __future__ import annotations
 
-import ormsgpack
-from locust import HttpUser, between, task
+from locust import HttpUser, between, events, task
+from locust.env import Environment
+from locust.runners import MasterRunner
 
 
 class LockManagerUser(HttpUser):
-    wait_time = between(1, 3)
-    host = "http://localhost:8001"
-
-    def on_start(self) -> None:
-        self.lock_counter = 0
+    wait_time = between(0.1, 0.5)
+    host = "http://localhost:8000"
 
     @task(3)
-    def acquire_exclusive_lock(self) -> None:
-        lock_id = f"lock_{self.lock_counter}"
-        self.lock_counter += 1
-
-        payload = {
-            "type": "lock_request",
-            "lock_id": lock_id,
-            "lock_type": "exclusive",
-            "requester": f"user_{id(self)}",
-        }
-
-        with self.client.post(
+    def acquire_release_lock(self) -> None:
+        resource_id = f"resource-{self.environment.runner.user_count % 10}"
+        acquire_response = self.client.post(
             "/message",
-            data=ormsgpack.packb(payload),
-            headers={"Content-Type": "application/msgpack"},
-            catch_response=True,
-        ) as response:
-            if response.status_code == 200:
-                response.success()
-            else:
-                response.failure(f"Failed to acquire lock: {response.status_code}")
+            json={
+                "msg_type": 7,
+                "sender_id": f"client-{id(self)}",
+                "payload": {
+                    "resource_id": resource_id,
+                    "lock_type": "EXCLUSIVE",
+                    "timeout": 5.0,
+                },
+                "term": 0,
+            },
+            name="acquire_lock",
+        )
+        if acquire_response.status_code == 200:
+            self.client.post(
+                "/message",
+                json={
+                    "msg_type": 8,
+                    "sender_id": f"client-{id(self)}",
+                    "payload": {
+                        "resource_id": resource_id,
+                        "lock_type": "EXCLUSIVE",
+                        "lock_id": "test",
+                    },
+                    "term": 0,
+                },
+                name="release_lock",
+            )
 
     @task(1)
-    def acquire_shared_lock(self) -> None:
-        lock_id = "shared_lock"
-
-        payload = {
-            "type": "lock_request",
-            "lock_id": lock_id,
-            "lock_type": "shared",
-            "requester": f"user_{id(self)}",
-        }
-
-        with self.client.post(
-            "/message",
-            data=ormsgpack.packb(payload),
-            headers={"Content-Type": "application/msgpack"},
-            catch_response=True,
-        ) as response:
-            if response.status_code == 200:
-                response.success()
-            else:
-                response.failure(
-                    f"Failed to acquire shared lock: {response.status_code}"
-                )
-
-    @task(2)
-    def release_lock(self) -> None:
-        lock_id = f"lock_{self.lock_counter - 1}" if self.lock_counter > 0 else "lock_0"
-
-        payload = {
-            "type": "lock_release",
-            "lock_id": lock_id,
-        }
-
-        with self.client.post(
-            "/message",
-            data=ormsgpack.packb(payload),
-            headers={"Content-Type": "application/msgpack"},
-            catch_response=True,
-        ) as response:
-            if response.status_code == 200:
-                response.success()
-            else:
-                response.failure(f"Failed to release lock: {response.status_code}")
+    def health_check(self) -> None:
+        self.client.get("/health", name="health_check")
 
 
 class QueueUser(HttpUser):
-    wait_time = between(0.5, 2)
-    host = "http://localhost:8011"
+    wait_time = between(0.1, 0.5)
+    host = "http://localhost:8100"
 
-    def on_start(self) -> None:
-        self.message_counter = 0
-
-    @task(5)
-    def enqueue_message(self) -> None:
-        message_id = f"msg_{id(self)}_{self.message_counter}"
-        self.message_counter += 1
-
-        payload = {
-            "type": "enqueue",
-            "queue_name": "test_queue",
-            "data": {"content": f"test message {self.message_counter}"},
-            "message_id": message_id,
-            "timestamp": time.time(),
-        }
-
-        with self.client.post(
+    @task(2)
+    def publish_message(self) -> None:
+        self.client.post(
             "/message",
-            data=ormsgpack.packb(payload),
-            headers={"Content-Type": "application/msgpack"},
-            catch_response=True,
-        ) as response:
-            if response.status_code == 200:
-                response.success()
-            else:
-                response.failure(f"Failed to enqueue: {response.status_code}")
+            json={
+                "msg_type": 10,
+                "sender_id": f"producer-{id(self)}",
+                "payload": {
+                    "topic": "test-topic",
+                    "payload": b"test message".hex(),
+                    "key": None,
+                },
+                "term": 0,
+            },
+            name="publish",
+        )
 
-    @task(3)
-    def dequeue_message(self) -> None:
-        payload = {
-            "type": "dequeue",
-            "queue_name": "test_queue",
-            "timeout": 1.0,
-        }
-
-        with self.client.post(
+    @task(2)
+    def consume_message(self) -> None:
+        self.client.post(
             "/message",
-            data=ormsgpack.packb(payload),
-            headers={"Content-Type": "application/msgpack"},
-            catch_response=True,
-        ) as response:
-            if response.status_code == 200:
-                if response.content:
-                    data = ormsgpack.unpackb(response.content)
-                    if data.get("message"):
-                        response.success()
-                    else:
-                        response.success()
-                else:
-                    response.failure("Empty response")
-            else:
-                response.failure(f"Failed to dequeue: {response.status_code}")
+            json={
+                "msg_type": 11,
+                "sender_id": f"consumer-{id(self)}",
+                "payload": {
+                    "topic": "test-topic",
+                    "consumer_group": "test-group",
+                    "max_messages": 10,
+                },
+                "term": 0,
+            },
+            name="consume",
+        )
 
 
 class CacheUser(HttpUser):
-    wait_time = between(0.1, 1)
-    host = "http://localhost:8021"
-
-    def on_start(self) -> None:
-        self.key_counter = 0
-
-    @task(7)
-    def cache_get(self) -> None:
-        key = f"key_{self.key_counter % 1000}"
-
-        payload = {
-            "type": "cache_get",
-            "key": key,
-        }
-
-        with self.client.post(
-            "/message",
-            data=ormsgpack.packb(payload),
-            headers={"Content-Type": "application/msgpack"},
-            catch_response=True,
-        ) as response:
-            if response.status_code == 200:
-                if response.content:
-                    data = ormsgpack.unpackb(response.content)
-                    if data.get("found"):
-                        response.success()
-                    else:
-                        response.success()
-                else:
-                    response.failure("Empty response")
-            else:
-                response.failure(f"Failed to get from cache: {response.status_code}")
+    wait_time = between(0.1, 0.5)
+    host = "http://localhost:8200"
 
     @task(3)
-    def cache_put(self) -> None:
-        key = f"key_{self.key_counter}"
-        self.key_counter += 1
-
-        payload = {
-            "type": "cache_put",
-            "key": key,
-            "value": {"data": f"value_{self.key_counter}"},
-        }
-
-        with self.client.post(
-            "/message",
-            data=ormsgpack.packb(payload),
-            headers={"Content-Type": "application/msgpack"},
-            catch_response=True,
-        ) as response:
-            if response.status_code == 200:
-                response.success()
-            else:
-                response.failure(f"Failed to put to cache: {response.status_code}")
-
-
-class MixedWorkloadUser(HttpUser):
-    wait_time = between(0.5, 2)
-    host = "http://localhost:8001"
-
-    def on_start(self) -> None:
-        self.counter = 0
-        self.locks_host = "http://localhost:8001"
-        self.queue_host = "http://localhost:8011"
-        self.cache_host = "http://localhost:8021"
-
-    @task(3)
-    def lock_operation(self) -> None:
-        self.client.base_url = self.locks_host
-        lock_id = f"mixed_lock_{self.counter}"
-        self.counter += 1
-
-        payload = {
-            "type": "lock_request",
-            "lock_id": lock_id,
-            "lock_type": "exclusive",
-            "requester": f"mixed_{id(self)}",
-        }
-
+    def read_cache(self) -> None:
+        key = f"key-{self.environment.runner.user_count % 100}"
         self.client.post(
             "/message",
-            data=ormsgpack.packb(payload),
-            headers={"Content-Type": "application/msgpack"},
+            json={
+                "msg_type": 14,
+                "sender_id": f"client-{id(self)}",
+                "payload": {"key": key},
+                "term": 0,
+            },
+            name="cache_read",
         )
 
-    @task(5)
-    def queue_operation(self) -> None:
-        self.client.base_url = self.queue_host
-
-        payload = {
-            "type": "enqueue",
-            "queue_name": "mixed_queue",
-            "data": {"content": f"mixed message {self.counter}"},
-            "message_id": f"mixed_msg_{self.counter}",
-            "timestamp": time.time(),
-        }
-
+    @task(1)
+    def write_cache(self) -> None:
+        key = f"key-{self.environment.runner.user_count % 100}"
         self.client.post(
             "/message",
-            data=ormsgpack.packb(payload),
-            headers={"Content-Type": "application/msgpack"},
+            json={
+                "msg_type": 15,
+                "sender_id": f"client-{id(self)}",
+                "payload": {"key": key, "value": b"test-value".hex()},
+                "term": 0,
+            },
+            name="cache_write",
         )
 
-    @task(7)
-    def cache_operation(self) -> None:
-        self.client.base_url = self.cache_host
 
-        if self.counter % 3 == 0:
-            payload = {
-                "type": "cache_put",
-                "key": f"mixed_key_{self.counter}",
-                "value": {"data": f"mixed_value_{self.counter}"},
-            }
-        else:
-            payload = {
-                "type": "cache_get",
-                "key": f"mixed_key_{self.counter % 100}",
-            }
-
-        self.client.post(
-            "/message",
-            data=ormsgpack.packb(payload),
-            headers={"Content-Type": "application/msgpack"},
-        )
+@events.init.add_listener
+def on_locust_init(environment: Environment, **kwargs: object) -> None:
+    if isinstance(environment.runner, MasterRunner):
+        print("Master node started")

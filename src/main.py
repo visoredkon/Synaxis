@@ -1,44 +1,73 @@
-import asyncio
-import sys
+from __future__ import annotations
+
+from asyncio import Event, get_running_loop, run
+from os import getenv
+from signal import SIGINT, SIGTERM
+from sys import stderr
+from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from .nodes import LockManager
-from .utils import get_config
+from src.nodes.base_node import BaseNode
+from src.nodes.cache_node import CacheNode
+from src.nodes.lock_manager import LockManager
+from src.nodes.queue_node import QueueNode
+from src.utils.config import Config
+from src.utils.metrics import MetricsCollector
+
+if TYPE_CHECKING:
+    pass
 
 
-async def main() -> None:
-    config = get_config()
-    logger.remove()
-    logger.add(sys.stderr, level=config.log_level)
-    node_addresses = {
-        node.node_id: (node.host, node.port) for node in config.cluster.nodes
+def get_node(config: Config, node_type: str) -> BaseNode:
+    node_map = {
+        "lock_manager": LockManager,
+        "queue_node": QueueNode,
+        "cache_node": CacheNode,
     }
-    from .consensuses.raft import RaftConfig
+    node_class = node_map.get(node_type)
+    if not node_class:
+        raise ValueError(f"Unknown node type: {node_type}")
+    return node_class(config)
 
-    raft_config = RaftConfig(
-        election_timeout_min=config.raft.election_timeout_min,
-        election_timeout_max=config.raft.election_timeout_max,
-        heartbeat_interval=config.raft.heartbeat_interval,
+
+async def run_node(node: BaseNode, metrics_port: int) -> None:
+    loop = get_running_loop()
+    stop_event = Event()
+
+    def signal_handler() -> None:
+        stop_event.set()
+
+    for sig in (SIGTERM, SIGINT):
+        loop.add_signal_handler(sig, signal_handler)
+
+    metrics = MetricsCollector()
+    metrics.start_server(metrics_port)
+
+    await node.start()
+
+    await stop_event.wait()
+
+    await node.stop()
+
+
+def main() -> None:
+    config = Config.from_env()
+
+    logger.remove()
+    logger.add(
+        stderr,
+        level=config.log_level,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
     )
-    lock_manager = LockManager(
-        node_id=config.node.node_id,
-        host=config.node.host,
-        port=config.node.port,
-        cluster_nodes=[node.node_id for node in config.cluster.nodes],
-        node_addresses=node_addresses,
-        raft_config=raft_config,
-    )
-    try:
-        await lock_manager.start()
-        logger.info(f"Lock manager {config.node.node_id} running")
-        while lock_manager.is_running():
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Shutting down lock manager")
-    finally:
-        await lock_manager.stop()
+
+    node_type = getenv("NODE_TYPE", "lock_manager")
+    node = get_node(config, node_type)
+
+    logger.info(f"Starting {node_type} node: {config.node.node_id}")
+
+    run(run_node(node, config.metrics_port))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
