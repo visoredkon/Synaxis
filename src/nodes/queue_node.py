@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from loguru import logger
+from ormsgpack import packb, unpackb
 
 from src.communication.message_passing import Message, MessageType
 from src.nodes.base_node import BaseNode, NodeRole
@@ -109,6 +110,9 @@ class QueueNode(BaseNode):
         self._pending_acks: dict[str, QueueMessage] = {}
         self._wal: list[QueueMessage] = []
 
+        self._wal_file = config.node.data_dir / f"{self.node_id}.wal"
+        self._wal_file.parent.mkdir(parents=True, exist_ok=True)
+
         self._redelivery_task: Task[None] | None = None
         self._metrics = MetricsCollector()
 
@@ -128,7 +132,6 @@ class QueueNode(BaseNode):
                 await self._redelivery_task
             except CancelledError:
                 pass
-        await self._persist_to_wal()
 
     def _register_handlers(self) -> None:
         super()._register_handlers()
@@ -183,6 +186,7 @@ class QueueNode(BaseNode):
         partition.next_offset += 1
 
         self._wal.append(message)
+        await self._persist_to_wal("PUBLISH", message.to_dict())
 
         self._metrics.record_queue_size(
             self.node_id,
@@ -290,6 +294,10 @@ class QueueNode(BaseNode):
                 group_id = gid
                 break
 
+        await self._persist_to_wal(
+            "ACK", {"message_id": message_id, "group_id": group_id}
+        )
+
         if group_id:
             group = self._consumer_groups[group_id]
             current = group.offsets.get(msg.partition, 0)
@@ -317,11 +325,89 @@ class QueueNode(BaseNode):
                     f"Message {msg_id} redelivery scheduled (attempt {msg.delivery_count})"
                 )
 
-    async def _persist_to_wal(self) -> None:
-        pass
+    async def _persist_to_wal(self, entry_type: str, data: dict[str, Any]) -> None:
+        packed = packb({"type": entry_type, "data": data})
+        length = len(packed).to_bytes(4, "big")
+
+        loop = get_event_loop()
+        await loop.run_in_executor(None, self._append_wal_entry, length + packed)
+
+    def _append_wal_entry(self, data: bytes) -> None:
+        with open(self._wal_file, "ab") as f:
+            f.write(data)
+            f.flush()
 
     async def _recover_from_wal(self) -> None:
-        pass
+        if not self._wal_file.exists():
+            return
+
+        logger.info(f"Recovering from WAL: {self._wal_file}")
+        try:
+            content = await get_event_loop().run_in_executor(
+                None, self._wal_file.read_bytes
+            )
+        except FileNotFoundError:
+            return
+
+        offset = 0
+        total_len = len(content)
+
+        while offset < total_len:
+            try:
+                if offset + 4 > total_len:
+                    break
+                length = int.from_bytes(content[offset : offset + 4], "big")
+                offset += 4
+
+                if offset + length > total_len:
+                    break
+
+                entry_data = content[offset : offset + length]
+                offset += length
+
+                entry = unpackb(entry_data)
+
+                if entry["type"] == "PUBLISH":
+                    msg_data = entry["data"]
+                    msg = QueueMessage.from_dict(msg_data)
+
+                    partition = self._get_or_create_partition(msg.topic, msg.partition)
+                    partition.messages.append(msg)
+                    if msg.offset >= partition.next_offset:
+                        partition.next_offset = msg.offset + 1
+                    self._wal.append(msg)
+
+                elif entry["type"] == "ACK":
+                    data = entry["data"]
+                    msg_id = data["message_id"]
+                    group_id = data["group_id"]
+
+                    target_msg = None
+                    for m in self._wal:
+                        if m.message_id == msg_id:
+                            target_msg = m
+                            break
+
+                    if target_msg:
+                        target_msg.state = MessageState.ACKNOWLEDGED
+                        if group_id:
+                            if group_id not in self._consumer_groups:
+                                self._consumer_groups[group_id] = ConsumerGroup(
+                                    group_id=group_id, topic=target_msg.topic
+                                )
+
+                            group = self._consumer_groups[group_id]
+                            current = group.offsets.get(target_msg.partition, 0)
+                            if target_msg.offset >= current:
+                                group.offsets[target_msg.partition] = (
+                                    target_msg.offset + 1
+                                )
+
+            except Exception as e:
+                logger.error(f"Error recovering WAL at offset {offset}: {e}")
+                break
+
+        logger.info("WAL recovery complete")
 
     async def _handle_publish(self, message: Message) -> Message:
         topic = message.payload["topic"]

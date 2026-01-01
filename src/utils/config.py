@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from os import getenv
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -13,6 +14,7 @@ class NodeConfig:
     node_id: str
     host: str
     port: int
+    data_dir: Path = Path("data")
     redis_url: str = "redis://localhost:6379"
     election_timeout_min: int = 150
     election_timeout_max: int = 300
@@ -49,6 +51,7 @@ class Config:
             host=host,
             port=port,
             redis_url=redis_url,
+            data_dir=Path(getenv("DATA_DIR", "data")),
             election_timeout_min=int(getenv("ELECTION_TIMEOUT_MIN", "150")),
             election_timeout_max=int(getenv("ELECTION_TIMEOUT_MAX", "300")),
             heartbeat_interval=int(getenv("HEARTBEAT_INTERVAL", "50")),
